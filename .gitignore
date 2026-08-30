@@ -1,0 +1,6 @@
+.venv-macos/
+.venv-windows/
+__pycache__/
+*.pyc
+*.log
+.schoology_pdf_downloader_state.json

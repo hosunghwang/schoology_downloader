@@ -1,0 +1,2 @@
+playwright>=1.52,<2
+keyring>=24,<30; sys_platform == "win32"
