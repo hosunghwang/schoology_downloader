@@ -1,6 +1,12 @@
 Schoology PDF Downloader v5.5
 =============================
 
+My kid's school uses Schoology for study materials and assignments. Manually downloading and
+organizing the materials from the website is tedious.
+This app automates the process by downloading the materials to a folder on my computer, allowing
+me to keep a local copy of the PDFs for personal use.
+
+
 WINDOWS - FIRST RUN
 -------------------
 1. Install Python 3.10 or newer from python.org if it is not already installed. Enable the
