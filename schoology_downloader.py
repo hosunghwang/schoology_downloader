@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import getpass
 import hashlib
+import io
 import json
 import os
 import platform
@@ -11,6 +13,7 @@ import re
 import subprocess
 import threading
 import traceback
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -58,12 +61,20 @@ except Exception:  # Allows --self-test to run before dependencies are installed
     async_playwright = None
 
 
-APP_NAME = "Schoology PDF Downloader"
-APP_VERSION = "5.5"
+APP_NAME = "Schoology File Downloader"
+APP_VERSION = "6.0"
+# Keep the original vault service name so upgrades can reuse saved credentials.
+CREDENTIAL_SERVICE_NAME = "Schoology PDF Downloader"
 START_URL = "https://basised-tx.schoology.com/course/8442701217/materials?f=1022828767"
 MAX_PAGES = 5000
 MAX_CANDIDATES = 5000
 MAX_WINDOWS_PATH = 235
+SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".docx")
+SUPPORTED_CONTENT_TYPES = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+}
 
 INVALID_WINDOWS_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 COURSE_RE = re.compile(r"/course/(\d+)(?:/|$)", re.I)
@@ -72,6 +83,7 @@ RESOURCE_RE = re.compile(
     r"media_album|external_tool|scorm)/\d+(?:/|$)",
     re.I,
 )
+MATERIAL_DETAIL_RE = re.compile(r"^/course/\d+/materials/gp/\d+(?:/|$)", re.I)
 WINDOWS_RESERVED = {
     "CON",
     "PRN",
@@ -135,15 +147,41 @@ def clean_component(value: object, limit: int = 90) -> str:
     return shorten_component(text, limit)
 
 
-def clean_filename(value: object, limit: int = 180) -> str:
+def supported_filename_extension(value: object) -> str:
+    text = unquote(str(value or "")).strip().strip('"')
+    suffix = Path(text).suffix.lower()
+    return suffix if suffix in SUPPORTED_EXTENSIONS else ""
+
+
+def supported_url_extension(url: str) -> str:
+    disposition_name = decode_disposition_filename(query_disposition(url))
+    extension = supported_filename_extension(disposition_name)
+    if extension:
+        return extension
+    return supported_filename_extension(Path(unquote(urlparse(url).path)).name)
+
+
+def clean_filename(
+    value: object,
+    expected_extension: str = ".pdf",
+    limit: int = 180,
+) -> str:
+    expected_extension = expected_extension.lower()
+    if expected_extension not in SUPPORTED_EXTENSIONS:
+        raise ValueError(f"Unsupported file extension: {expected_extension}")
+
     text = unquote(str(value or "")).strip()
-    text = INVALID_WINDOWS_CHARS.sub("_", text).rstrip(" .") or "download.pdf"
+    text = INVALID_WINDOWS_CHARS.sub("_", text).rstrip(" .") or f"download{expected_extension}"
     if text.split(".", 1)[0].upper() in WINDOWS_RESERVED:
         text = f"_{text}"
-    text = shorten_component(text, limit, preserve_suffix=True)
-    if not text.lower().endswith(".pdf"):
-        text += ".pdf"
-    return text
+
+    suffix = Path(text).suffix
+    if suffix.lower() in SUPPORTED_EXTENSIONS:
+        if suffix.lower() != expected_extension:
+            text = f"{text[:-len(suffix)]}{expected_extension}"
+    else:
+        text += expected_extension
+    return shorten_component(text, limit, preserve_suffix=True)
 
 
 def decode_disposition_filename(content_disposition: str) -> str:
@@ -180,6 +218,7 @@ def filename_from_response(
     final_url: str,
     headers: dict[str, str] | None,
     link_text: str = "",
+    expected_extension: str = ".pdf",
 ) -> str:
     headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
     choices = [
@@ -201,13 +240,16 @@ def filename_from_response(
 
     for line in str(link_text or "").splitlines():
         line = line.strip()
-        if line.lower().endswith(".pdf"):
+        if supported_filename_extension(line):
             choices.append(line)
 
     for choice in choices:
+        if supported_filename_extension(choice) == expected_extension:
+            return clean_filename(choice, expected_extension)
+    for choice in choices:
         if choice:
-            return clean_filename(choice)
-    return "download.pdf"
+            return clean_filename(choice, expected_extension)
+    return f"download{expected_extension}"
 
 
 def extract_course_id(url: str) -> str | None:
@@ -288,29 +330,77 @@ def is_allowed_page_url(url: str, host: str, course_id: str) -> bool:
     return bool(RESOURCE_RE.match(parsed.path))
 
 
+def is_material_detail_url(url: str, host: str) -> bool:
+    parsed = urlparse(url)
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc.lower() == host.lower()
+        and bool(MATERIAL_DETAIL_RE.match(parsed.path))
+    )
+
+
 def looks_like_file_candidate(url: str, text: str = "", download_attr: str = "") -> bool:
     decoded = unquote(str(url or "")).lower()
     label = str(text or "").lower()
     path = urlparse(decoded).path
+    has_supported_name = any(
+        extension in decoded or extension in label
+        for extension in SUPPORTED_EXTENSIONS
+    )
     return any(
         (
-            ".pdf" in decoded,
+            has_supported_name,
             "content-disposition=" in decoded,
             bool(download_attr),
             "/file/" in path,
             "/attachment" in path,
             "/download" in path,
             "download=" in decoded,
-            label.strip().endswith(".pdf"),
+            any(label.strip().endswith(extension) for extension in SUPPORTED_EXTENSIONS),
             "download pdf" in label,
+            "download powerpoint" in label,
+            "download word" in label,
         )
     )
 
 
 def looks_like_pdf(body: bytes, content_type: str = "") -> bool:
-    if "application/pdf" in str(content_type).lower():
-        return True
-    return body[:32].lstrip(b"\xef\xbb\xbf\x00\t\r\n ").startswith(b"%PDF-")
+    del content_type
+    return b"%PDF-" in body[:1024]
+
+
+def content_type_extension(content_type: str) -> str:
+    mime = str(content_type or "").split(";", 1)[0].strip().lower()
+    return SUPPORTED_CONTENT_TYPES.get(mime, "")
+
+
+def detect_supported_extension(body: bytes, content_type: str = "") -> str:
+    if looks_like_pdf(body, content_type):
+        return ".pdf"
+
+    if not body.startswith(b"PK"):
+        return ""
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            names = set(archive.namelist())
+            if "[Content_Types].xml" not in names:
+                return ""
+            content_types = archive.read("[Content_Types].xml").lower()
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile):
+        return ""
+
+    if (
+        "word/document.xml" in names
+        and b"wordprocessingml.document.main+xml" in content_types
+    ):
+        return ".docx"
+    if (
+        "ppt/presentation.xml" in names
+        and b"presentationml.presentation.main+xml" in content_types
+    ):
+        return ".pptx"
+    return ""
 
 
 def file_sha256(path: Path) -> str:
@@ -319,14 +409,6 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def file_looks_like_pdf(path: Path) -> bool:
-    try:
-        with path.open("rb") as handle:
-            return looks_like_pdf(handle.read(32))
-    except OSError:
-        return False
 
 
 def bytes_sha256(body: bytes) -> str:
@@ -342,7 +424,10 @@ def fit_destination_parts(
     safe_folders = [clean_component(part) for part in folders if str(part or "").strip()]
     if not safe_folders:
         safe_folders = ["Materials"]
-    safe_name = clean_filename(filename)
+    safe_name = clean_filename(
+        filename,
+        supported_filename_extension(filename) or ".pdf",
+    )
 
     def total_length() -> int:
         return len(str(root.joinpath(*safe_folders, safe_name)))
@@ -414,17 +499,23 @@ def select_destination(
     key: str,
     digest: str,
 ) -> tuple[Path, bool, str]:
+    safe_folders, safe_name = fit_destination_parts(root, folders, filename)
+    directory = root.joinpath(*safe_folders)
+    directory.mkdir(parents=True, exist_ok=True)
     recorded = state.resolve_recorded(key)
-    if recorded and recorded.is_file() and file_looks_like_pdf(recorded):
+    expected_suffix = Path(safe_name).suffix.lower()
+    if (
+        recorded
+        and recorded.is_file()
+        and recorded.suffix.lower() == expected_suffix
+        and recorded.parent.resolve() == directory.resolve()
+    ):
         try:
             if file_sha256(recorded) == digest:
                 return recorded, True, "saved source"
         except OSError:
             pass
 
-    safe_folders, safe_name = fit_destination_parts(root, folders, filename)
-    directory = root.joinpath(*safe_folders)
-    directory.mkdir(parents=True, exist_ok=True)
     desired = directory / safe_name
     stem, suffix = desired.stem, desired.suffix
 
@@ -433,7 +524,7 @@ def select_destination(
         if not candidate.exists() or candidate.stat().st_size == 0:
             return candidate, False, "new file"
         try:
-            if file_looks_like_pdf(candidate) and file_sha256(candidate) == digest:
+            if file_sha256(candidate) == digest:
                 return candidate, True, "identical file"
         except OSError:
             pass
@@ -471,13 +562,27 @@ class LinkParser(HTMLParser):
 
 
 def extract_file_urls_from_text(text: str, base_url: str) -> list[str]:
-    decoded = html_unescape(str(text or "")).replace("\\/", "/")
+    decoded_variants: list[str] = []
+    decoded = html_unescape(str(text or ""))
+    for _ in range(4):
+        decoded = re.sub(r"\\u002[fF]", "/", decoded)
+        decoded = re.sub(r"\\u003[aA]", ":", decoded)
+        decoded = decoded.replace("\\/", "/")
+        if decoded not in decoded_variants:
+            decoded_variants.append(decoded)
+        next_decoded = html_unescape(unquote(decoded))
+        if next_decoded == decoded:
+            break
+        decoded = next_decoded
+
     parser = LinkParser()
     try:
-        parser.feed(decoded)
+        parser.feed(decoded_variants[0])
     except Exception:
         pass
-    absolute = re.findall(r"https?://[^\s'\"<>]+", decoded, flags=re.I)
+    absolute: list[str] = []
+    for variant in decoded_variants:
+        absolute.extend(re.findall(r"https?://[^\s'\"<>]+", variant, flags=re.I))
     result: list[str] = []
     seen: set[str] = set()
     for value in [*parser.urls, *absolute]:
@@ -550,6 +655,9 @@ class CandidateRegistry:
     def values(self) -> list[Candidate]:
         return list(self._items.values())
 
+    def clear(self) -> None:
+        self._items.clear()
+
     def __len__(self) -> int:
         return len(self._items)
 
@@ -587,7 +695,9 @@ class NetworkCollector:
             content_type = headers.get("content-type", "").lower()
             disposition = headers.get("content-disposition", "")
             url = canonical_url(response.url)
-            if "application/pdf" in content_type or ".pdf" in disposition.lower():
+            if content_type_extension(content_type) or looks_like_file_candidate(
+                url, disposition
+            ):
                 self.registry.add(
                     Candidate(url, folders, referrer=referrer, headers=headers, method="network")
                 )
@@ -633,6 +743,48 @@ async def get_dom_links(page) -> list[dict[str, object]]:
     )
 
 
+async def infer_material_folders(page, page_url: str) -> tuple[str, ...]:
+    """Read only Schoology breadcrumb and parent-folder elements."""
+    parsed = urlparse(page_url)
+    if not MATERIAL_DETAIL_RE.match(parsed.path):
+        return ()
+
+    selectors = [
+        'nav[aria-label*="breadcrumb" i] a[href*="/materials?f="]',
+        '.folder-title a[href*="/materials?f="]',
+        'a.folder-title[href*="/materials?f="]',
+    ]
+
+    items: list[dict[str, str]] = []
+    for selector in selectors:
+        try:
+            items.extend(
+                await page.eval_on_selector_all(
+                    selector,
+                    """els => els.map(e => ({
+                      href: e.href || '',
+                      text: (e.innerText || e.textContent || '').trim()
+                    }))""",
+                )
+            )
+        except Exception:
+            continue
+
+    folders = ["Materials"]
+    seen_folder_ids: set[str] = set()
+    for item in items:
+        href = canonical_url(urljoin(page_url, str(item.get("href") or "")))
+        linked_folder = folder_id(href)
+        if not linked_folder or linked_folder in seen_folder_ids:
+            continue
+        name = best_label(str(item.get("text") or ""))
+        if not name:
+            continue
+        seen_folder_ids.add(linked_folder)
+        folders.append(clean_component(name))
+    return tuple(folders) if len(folders) > 1 else ()
+
+
 async def scroll_lazy_content(page) -> None:
     stable = 0
     previous = 0
@@ -647,8 +799,43 @@ async def scroll_lazy_content(page) -> None:
             break
 
 
+async def discover_rendered_file_links(
+    context,
+    url: str,
+    referrer: str,
+) -> tuple[list[str], str]:
+    """Render a Schoology viewer so its JavaScript-created original-file URL exists."""
+    page = await context.new_page()
+    try:
+        goto_options: dict[str, object] = {
+            "wait_until": "domcontentloaded",
+            "timeout": 60000,
+        }
+        if referrer:
+            goto_options["referer"] = referrer
+        await page.goto(url, **goto_options)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(750)
+
+        documents = [page.url, await page.content()]
+        documents.extend(frame.url for frame in page.frames)
+        links: list[str] = []
+        seen: set[str] = set()
+        for document in documents:
+            for link in extract_file_urls_from_text(document, page.url):
+                if link not in seen:
+                    seen.add(link)
+                    links.append(link)
+        return links, page.url
+    finally:
+        await page.close()
+
+
 def credential_service(host: str) -> str:
-    return f"{APP_NAME}:{host.lower()}"
+    return f"{CREDENTIAL_SERVICE_NAME}:{host.lower()}"
 
 
 class CredentialVaultError(RuntimeError):
@@ -1090,6 +1277,15 @@ async def fetch_and_save_candidate(
     headers = {"referer": candidate.referrer} if candidate.referrer else None
     response = None
     try:
+        candidate_extension = (
+            supported_filename_extension(candidate.text)
+            or supported_url_extension(candidate.url)
+        )
+        if candidate_extension in {".docx", ".pptx"}:
+            log(
+                f"[FETCH] Requesting {candidate_extension} candidate "
+                f"via={candidate.method}: {log_safe_url(candidate.url)}"
+            )
         response = await context.request.get(
             candidate.url,
             headers=headers,
@@ -1106,19 +1302,79 @@ async def fetch_and_save_candidate(
             log(f"[FAIL] HTTP {response.status}: {log_safe_url(candidate.url)}")
             return "failed"
 
-        if not looks_like_pdf(body, content_type):
+        detected_extension = detect_supported_extension(body, content_type)
+        if not detected_extension:
             if "html" in content_type.lower() or "json" in content_type.lower():
-                for link in extract_file_urls_from_text(body.decode("utf-8", "replace"), final_url):
-                    registry.add(
+                links = extract_file_urls_from_text(
+                    body.decode("utf-8", "replace"), final_url
+                )
+                discovered_links = [(link, final_url) for link in links]
+                expected_extension = (
+                    supported_filename_extension(candidate.text)
+                    or supported_url_extension(candidate.url)
+                )
+                matching_links = [
+                    item
+                    for item in discovered_links
+                    if supported_url_extension(item[0]) == expected_extension
+                ]
+                if (
+                    expected_extension in {".docx", ".pptx"}
+                    and supported_url_extension(candidate.url) != expected_extension
+                ):
+                    try:
+                        rendered_links, rendered_referrer = (
+                            await discover_rendered_file_links(
+                                context,
+                                candidate.url,
+                                candidate.referrer,
+                            )
+                        )
+                        discovered_links.extend(
+                            (link, rendered_referrer or final_url)
+                            for link in rendered_links
+                        )
+                        matching_links = [
+                            item
+                            for item in discovered_links
+                            if supported_url_extension(item[0]) == expected_extension
+                        ]
+                        if matching_links:
+                            log(
+                                f"[DISCOVER] Found original {expected_extension} "
+                                "download in the rendered Schoology viewer."
+                            )
+                    except Exception as exc:
+                        log(f"[DISCOVER] Could not render the document viewer: {exc}")
+                if expected_extension and matching_links:
+                    discovered_links = matching_links
+                for link, link_referrer in discovered_links:
+                    added = registry.add(
                         Candidate(
                             link,
                             candidate.folders,
                             text=candidate.text,
-                            referrer=final_url,
+                            referrer=link_referrer,
                             method="response-body",
                         )
                     )
-            return "not_pdf"
+                    link_extension = supported_url_extension(link)
+                    if link_extension in {".docx", ".pptx"}:
+                        status = "Queued" if added else "Already queued"
+                        log(f"[DISCOVER] {status} original {link_extension} download.")
+            filename_hint = (
+                decode_disposition_filename(response_headers.get("content-disposition", ""))
+                or decode_disposition_filename(query_disposition(final_url))
+                or decode_disposition_filename(query_disposition(candidate.url))
+                or candidate.text
+            )
+            filename_hint = re.sub(r"\s+", " ", filename_hint).strip()[:180] or "unknown"
+            log(
+                f"[UNSUPPORTED] type={content_type or 'unknown'} "
+                f"name={filename_hint} via={candidate.method}: "
+                f"{log_safe_url(candidate.url)}"
+            )
+            return "not_supported"
 
         combined_headers = {**candidate.headers, **response_headers}
         filename = filename_from_response(
@@ -1126,6 +1382,7 @@ async def fetch_and_save_candidate(
             final_url,
             combined_headers,
             candidate.text,
+            expected_extension=detected_extension,
         )
         digest = bytes_sha256(body)
         key = source_key(candidate.url, candidate.folders)
@@ -1156,7 +1413,7 @@ async def fetch_and_save_candidate(
 class RunSummary:
     pages: int = 0
     candidates: int = 0
-    pdfs: int = 0
+    files: int = 0
     downloaded: int = 0
     skipped: int = 0
     failed: int = 0
@@ -1177,6 +1434,7 @@ async def run_downloader(
     login_continue: threading.Event,
     cancel_event: threading.Event,
     emit: Callable[[str], None],
+    crawl_all: bool = False,
 ) -> RunSummary:
     if async_playwright is None:
         raise RuntimeError(
@@ -1196,6 +1454,11 @@ async def run_downloader(
     log = logger
     log(f"{APP_NAME} v{APP_VERSION}")
     log(f"Course ID: {course_id}")
+    log(
+        "Scan mode: all linked course material pages"
+        if crawl_all
+        else "Scan mode: provided URL only"
+    )
     log(f"Output: {root}")
     log("Passwords and signed CDN query strings are never written to this log.")
 
@@ -1262,8 +1525,18 @@ async def run_downloader(
                     "then press Continue after login."
                 )
 
-            page_queue: deque[tuple[str, tuple[str, ...]]] = deque(
-                [(start, ("Materials",))]
+            # Do not carry candidates observed during login or redirects into the scan.
+            # The scan below reloads the supplied URL and captures its responses afresh.
+            await collector.drain()
+            registry.clear()
+
+            initial_folders = await infer_material_folders(page, start)
+            if not initial_folders:
+                initial_folders = ("Materials",)
+            collector.set_context(initial_folders, start)
+
+            page_queue: deque[tuple[str, tuple[str, ...], bool]] = deque(
+                [(start, initial_folders, crawl_all)]
             )
             queued = {start}
             seen: set[str] = set()
@@ -1286,10 +1559,10 @@ async def run_downloader(
                         )
                         if result == "downloaded":
                             summary.downloaded += 1
-                            summary.pdfs += 1
+                            summary.files += 1
                         elif result == "skipped":
                             summary.skipped += 1
-                            summary.pdfs += 1
+                            summary.files += 1
                         elif result == "failed":
                             summary.failed += 1
                         else:
@@ -1298,7 +1571,7 @@ async def run_downloader(
             while page_queue and len(seen) < MAX_PAGES:
                 if cancel_event.is_set():
                     raise UserCancelled("Cancelled by user.")
-                url, folders = page_queue.popleft()
+                url, folders, expand_links = page_queue.popleft()
                 if url in seen:
                     continue
                 seen.add(url)
@@ -1311,6 +1584,10 @@ async def run_downloader(
                     except PlaywrightTimeoutError:
                         pass
                     await scroll_lazy_content(page)
+                    inferred_folders = await infer_material_folders(page, url)
+                    if inferred_folders:
+                        folders = inferred_folders
+                        collector.set_context(folders, url)
                     await collector.drain()
                     links = await get_dom_links(page)
                 except Exception as exc:
@@ -1333,8 +1610,9 @@ async def run_downloader(
                     if not href:
                         continue
 
+                    linked_material_page = is_material_detail_url(href, host)
                     fileish = looks_like_file_candidate(href, text, download_attr)
-                    if fileish:
+                    if fileish and not (crawl_all and linked_material_page):
                         registry.add(
                             Candidate(
                                 href,
@@ -1345,7 +1623,11 @@ async def run_downloader(
                             )
                         )
 
-                    if not is_allowed_page_url(href, host, course_id):
+                    if not expand_links:
+                        continue
+
+                    same_course_page = is_allowed_page_url(href, host, course_id)
+                    if not same_course_page and not linked_material_page:
                         continue
 
                     next_folders = folders
@@ -1360,7 +1642,9 @@ async def run_downloader(
 
                     if href not in seen and href not in queued:
                         queued.add(href)
-                        page_queue.append((href, tuple(next_folders)))
+                        page_queue.append(
+                            (href, tuple(next_folders), same_course_page)
+                        )
 
                 log(
                     f"    pages={len(seen)} candidates={len(registry)} "
@@ -1378,11 +1662,11 @@ async def run_downloader(
             log("========== COMPLETE ==========")
             log(f"Pages scanned      : {summary.pages}")
             log(f"Candidates checked : {summary.candidates}")
-            log(f"PDFs confirmed     : {summary.pdfs}")
+            log(f"Files confirmed    : {summary.files}")
             log(f"Downloaded         : {summary.downloaded}")
             log(f"Skipped            : {summary.skipped}")
             log(f"Failed             : {summary.failed}")
-            log(f"Non-PDF links      : {summary.rejected}")
+            log(f"Unsupported links  : {summary.rejected}")
             log(f"Log file           : {logger.path}")
             return summary
         finally:
@@ -1406,7 +1690,7 @@ def save_settings(data: dict[str, object]) -> None:
 
 
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, crawl_all: bool = False):
         self.root = root
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -1429,13 +1713,20 @@ class App:
         self.url.insert(0, str(self.settings.get("url") or START_URL))
         self.url.pack(fill="x", padx=10)
 
+        self.scan_all = tk.BooleanVar(value=crawl_all)
+        tk.Checkbutton(
+            root,
+            text="Scan all linked folders/material pages in this course (--all)",
+            variable=self.scan_all,
+        ).pack(anchor="w", padx=10, pady=(4, 0))
+
         folder_row = tk.Frame(root)
         folder_row.pack(fill="x", padx=10, pady=8)
         tk.Label(folder_row, text="Download folder:").pack(side="left")
         self.folder = tk.Entry(folder_row)
         self.folder.insert(
             0,
-            str(self.settings.get("output") or (Path.home() / "Schoology-PDFs")),
+            str(self.settings.get("output") or (Path.home() / "Schoology-Files")),
         )
         self.folder.pack(side="left", fill="x", expand=True, padx=8)
         tk.Button(folder_row, text="Browse...", command=self.browse).pack(side="right")
@@ -1558,6 +1849,7 @@ class App:
         start_url = self.url.get().strip()
         output = self.folder.get().strip()
         username = self.username.get().strip()
+        crawl_all = self.scan_all.get()
         host = urlparse(start_url).netloc.lower()
         typed_password = self.password.get()
         try:
@@ -1614,6 +1906,7 @@ class App:
                         self.login_continue,
                         self.cancel_event,
                         lambda line: self.events.put(("log", line)),
+                        crawl_all=crawl_all,
                     )
                 )
                 self.events.put(("finished", summary))
@@ -1740,7 +2033,7 @@ def delete_saved_password(host: str, username: str) -> None:
         print(f"Could not access the credential vault: {exc}")
 
 
-def run_console() -> int:
+def run_console(crawl_all: bool = False) -> int:
     """Terminal interface used on macOS when Tkinter is unavailable."""
     settings = load_settings()
     print(f"{APP_NAME} v{APP_VERSION}")
@@ -1752,9 +2045,14 @@ def run_console() -> int:
         "Schoology course/materials URL",
         str(settings.get("url") or START_URL),
     )
+    print(
+        "Scan scope: all linked course material pages (--all)."
+        if crawl_all
+        else "Scan scope: only the exact URL provided (default)."
+    )
     output = prompt_with_default(
         "Download folder",
-        str(settings.get("output") or (Path.home() / "Schoology-PDFs")),
+        str(settings.get("output") or (Path.home() / "Schoology-Files")),
     )
     username = prompt_with_default(
         "Microsoft/Schoology email (enter - to clear and log in manually)",
@@ -1846,6 +2144,7 @@ def run_console() -> int:
                 login_continue,
                 cancel_event,
                 emit,
+                crawl_all=crawl_all,
             )
         )
     except KeyboardInterrupt:
@@ -1865,13 +2164,51 @@ def run_console() -> int:
 def run_self_test() -> int:
     import tempfile
 
+    def sample_ooxml(main_part: str, main_content_type: str) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "[Content_Types].xml",
+                f'<Types><Override PartName="/{main_part}" '
+                f'ContentType="{main_content_type}"/></Types>',
+            )
+            archive.writestr(main_part, "<root/>")
+        return buffer.getvalue()
+
     sample = (
         "https://files-cdn.schoology.com/abc?content-type=application%2Fpdf&"
         "content-disposition=attachment%3B%2Bfilename%3D%22Proof%2BWorksheet%2B1.pdf%22&"
         "Expires=1788047203&Signature=secret"
     )
+    docx_body = sample_ooxml(
+        "word/document.xml",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    )
+    pptx_body = sample_ooxml(
+        "ppt/presentation.xml",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+    )
+    pptx_source = "https://example.test/attachment/1/source/Lesson.pptx"
+    encoded_custom = quote(
+        '{"downloadLink":"https:\\/\\/example.test\\/attachment\\/1'
+        '\\/source\\/Lesson.pptx"}',
+        safe="",
+    )
+    viewer_html = f'<iframe src="/viewer#custom={encoded_custom}"></iframe>'
     assert extract_course_id(START_URL) == "8442701217"
     assert filename_from_response(sample, sample, {}) == "Proof Worksheet 1.pdf"
+    assert clean_filename("Lesson 1.2", ".docx") == "Lesson 1.2.docx"
+    assert clean_filename("Slides.pdf", ".pptx") == "Slides.pptx"
+    assert detect_supported_extension(b"%PDF-1.7\nexample") == ".pdf"
+    assert detect_supported_extension(docx_body) == ".docx"
+    assert detect_supported_extension(pptx_body) == ".pptx"
+    assert not detect_supported_extension(b"not a supported document")
+    assert looks_like_file_candidate("https://example.test/Lesson.docx")
+    assert looks_like_file_candidate("https://example.test/Slides.pptx")
+    assert pptx_source in extract_file_urls_from_text(
+        viewer_html, "https://example.test/docviewer"
+    )
+    assert supported_url_extension(pptx_source) == ".pptx"
     assert clean_component("Current Menu Item\nMaterials Dropdown") == (
         "Current Menu Item_Materials Dropdown"
     )
@@ -1886,10 +2223,20 @@ def run_self_test() -> int:
         "basised-tx.schoology.com",
         "8442701217",
     )
+    assert is_material_detail_url(
+        "https://basised-tx.schoology.com/course/8442701215/materials/gp/8490805601",
+        "basised-tx.schoology.com",
+    )
+    assert not is_material_detail_url(
+        "https://other.example/course/8442701215/materials/gp/8490805601",
+        "basised-tx.schoology.com",
+    )
     assert "Signature=" not in stable_url(sample)
     assert "secret" not in scrub_log_secrets(f"failed: {sample}")
     assert allowed_autofill_host("login.microsoftonline.com", "basised-tx.schoology.com")
     assert not allowed_autofill_host("example.com", "basised-tx.schoology.com")
+    assert not parse_arguments([]).crawl_all
+    assert parse_arguments(["--all"]).crawl_all
 
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1919,23 +2266,65 @@ def run_self_test() -> int:
         )
         assert not skip and collision.name == "Review [2].pdf"
 
+        docx_path = root / "Materials" / "Unit 1" / "Notes.docx"
+        atomic_write(docx_path, docx_body)
+        assert detect_supported_extension(docx_path.read_bytes()) == ".docx"
+
+        mislabeled = root / "Materials" / "Legacy.pdf"
+        atomic_write(mislabeled, docx_body)
+        repair_key = source_key(
+            "https://example.test/attachment/source/Notes.docx",
+            ("Materials",),
+        )
+        state.record(repair_key, mislabeled, bytes_sha256(docx_body), len(docx_body))
+        repaired, skip, _ = select_destination(
+            root,
+            ("Materials",),
+            "Recovered Notes.docx",
+            state,
+            repair_key,
+            bytes_sha256(docx_body),
+        )
+        assert not skip and repaired.suffix == ".docx"
+
     print("Self-test passed.")
     return 0
 
 
-def main() -> int:
-    import sys
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser.add_argument(
+        "--all",
+        dest="crawl_all",
+        action="store_true",
+        help="scan all linked material pages in the selected course",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="use the terminal interface even when Tkinter is available",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run built-in tests and exit",
+    )
+    return parser.parse_args(argv)
 
-    if "--self-test" in sys.argv:
+
+def main() -> int:
+    args = parse_arguments()
+
+    if args.self_test:
         return run_self_test()
-    if "--cli" in sys.argv or tk is None:
-        return run_console()
+    if args.cli or tk is None:
+        return run_console(crawl_all=args.crawl_all)
     try:
         root_window = tk.Tk()
     except Exception as exc:
         print(f"Graphical interface unavailable ({exc}); using the terminal interface.")
-        return run_console()
-    App(root_window)
+        return run_console(crawl_all=args.crawl_all)
+    App(root_window, crawl_all=args.crawl_all)
     root_window.mainloop()
     return 0
 

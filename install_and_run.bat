@@ -24,7 +24,7 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 ".venv-windows\Scripts\python.exe" -m playwright install chromium
 if errorlevel 1 goto failed
-".venv-windows\Scripts\python.exe" schoology_downloader.py
+".venv-windows\Scripts\python.exe" schoology_downloader.py %*
 if errorlevel 1 goto failed
 goto end
 

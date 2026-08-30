@@ -1,10 +1,10 @@
-Schoology PDF Downloader v5.5
-=============================
+Schoology File Downloader v6.0
+==============================
 
 My kid's school uses Schoology for study materials and assignments. Manually downloading and
 organizing the materials from the website is tedious.
 This app automates the process by downloading the materials to a folder on my computer, allowing
-me to keep a local copy of the PDFs for personal use.
+me to keep a local copy of PDF, PowerPoint (.pptx), and Word (.docx) files for personal use.
 
 
 WINDOWS - FIRST RUN
@@ -35,6 +35,21 @@ MACOS - LATER RUNS
 Double-click run.command, or run:
 
   ./run.command
+
+By default, the downloader scans only the exact Schoology URL you provide. To
+scan all linked folders and material pages in the same course, either select
+the "Scan all linked folders/material pages" checkbox in the GUI or run:
+
+  ./run.command --all
+
+Terminal-only examples:
+
+  ./run.command --cli
+  ./run.command --cli --all
+
+On Windows, the equivalent Command Prompt command is:
+
+  run.bat --all
 
 The .sh launchers are also available for users who prefer a shell.
 
@@ -74,12 +89,21 @@ screens remain interactive for security.
 
 DOWNLOAD FIXES
 --------------
+- Scans only the exact provided URL by default; --all enables the recursive
+  whole-course scan.
 - Removes Windows-invalid control characters/newlines from path components.
 - Never turns the Schoology navigation menu into a directory tree.
 - Rejects links belonging to a different Schoology course.
-- Saves each PDF from a single immediate request so signed CDN URLs do not expire
+- Saves each supported file from a single immediate request so signed CDN URLs do not expire
   between a separate confirmation request and the actual download.
-- Preserves original PDF filenames, spaces, and capitalization.
+- Downloads and validates .pdf, .pptx, and .docx files.
+- Extracts original Word/PowerPoint download URLs embedded in Schoology's
+  document viewer instead of saving only its generated PDF preview.
+- Uses Schoology breadcrumbs and the material's parent-folder link so a direct
+  material URL is saved under its actual folder hierarchy.
+- In --all mode, opens directly linked material-detail pages from a linked
+  source course as leaf pages without crawling into that other course.
+- Preserves original filenames, spaces, capitalization, and file extensions.
 - Adds [2], [3], and so on only for genuinely different same-name files.
 - Skips completed identical files on later runs.
 - Finds files in page links and authenticated browser network responses.

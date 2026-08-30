@@ -33,7 +33,7 @@ fi
 .venv-macos/bin/python -m pip install --upgrade pip || fail $?
 .venv-macos/bin/python -m pip install -r requirements.txt || fail $?
 .venv-macos/bin/python -m playwright install chromium || fail $?
-.venv-macos/bin/python schoology_downloader.py
+.venv-macos/bin/python schoology_downloader.py "$@"
 STATUS=$?
 
 echo

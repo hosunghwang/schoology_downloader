@@ -11,7 +11,7 @@ if [ ! -x ".venv-macos/bin/python" ]; then
   exit 1
 fi
 
-.venv-macos/bin/python schoology_downloader.py
+.venv-macos/bin/python schoology_downloader.py "$@"
 STATUS=$?
 
 echo

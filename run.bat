@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 if not exist ".venv-windows\Scripts\python.exe" goto not_installed
-".venv-windows\Scripts\python.exe" schoology_downloader.py
+".venv-windows\Scripts\python.exe" schoology_downloader.py %*
 if errorlevel 1 pause
 goto end
 
